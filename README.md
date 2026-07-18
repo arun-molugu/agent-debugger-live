@@ -22,6 +22,8 @@ Real-time failure detection for LangChain/LangGraph agents. No pasting, no dashb
 
 Can also **block** a response before it's returned when a critical-severity failure is detected, instead of only flagging it after the fact.
 
+Includes a **gated semantic layer** — when the 15 deterministic checks find nothing wrong, a GPT-4o-mini call runs to catch subtler issues (logical contradictions, unsupported claims) that keyword matching structurally can't see. Only runs when deterministic checks stay silent, keeping most responses fast while still catching what they'd miss.
+
 ## Why this exists
 
 Most agent failures don't throw errors. They return `status: success` and look completely normal — while doing the wrong thing. This catches that failure class, live, as it happens.
