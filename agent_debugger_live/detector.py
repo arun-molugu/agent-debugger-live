@@ -1,6 +1,7 @@
 import re
+import os
 from langchain_core.callbacks import BaseCallbackHandler
-
+from openai import OpenAI
 
 SUCCESS_CLAIMS = [
     "successfully", "confirmed", "completed", "is trading at",
@@ -71,8 +72,34 @@ def extract_numbers(text: str) -> list:
     return [n.rstrip('.') for n in re.findall(r'-?\d+\.?\d*', text)]
 
 
+def semantic_check(agent_text: str, context: str = "") -> bool:
+    """
+    Layer 2 — only called when Layer 1 flags something ambiguous.
+    Returns True if GPT-4o-mini judges this response as problematic.
+    """
+    if not os.getenv("OPENAI_API_KEY"):
+        return False
+    try:
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": f"""Context: {context}
+Agent response: {agent_text}
+
+Does this agent response contain a subtle logical contradiction, an unsupported claim, or a mismatch with the context that a keyword search would miss? Answer only YES or NO."""
+            }],
+            max_tokens=5,
+            temperature=0
+        )
+        answer = response.choices[0].message.content.strip().upper()
+        return "YES" in answer
+    except Exception:
+        return False
+
 class LiveWatchHandler(BaseCallbackHandler):
-    def __init__(self, verbose: bool = True, block_on_critical: bool = False):
+    def __init__(self, verbose: bool = True, block_on_critical: bool = False, use_semantic_layer: bool = False):
         self.steps = []
         self.last_tool_output = None
         self.validator_topics = []
@@ -83,6 +110,7 @@ class LiveWatchHandler(BaseCallbackHandler):
         self.last_scheduled_date = None
         self.block_on_critical = block_on_critical
         self.blocked = False
+        self.use_semantic_layer = use_semantic_layer
         self.retry_count = 0
         self.last_tool_error = False 
         self.tool_calls_since_error = 0
@@ -146,6 +174,7 @@ class LiveWatchHandler(BaseCallbackHandler):
     def check_agent_response(self, agent_text: str, is_validator_complaint: bool = False):
         content_lower = agent_text.lower()
         claims_success = any(word in content_lower for word in SUCCESS_CLAIMS)
+        flags_before_this_check = len(self.flags)
 
         self.steps.append({
             "step": len(self.steps) + 1,
@@ -289,6 +318,19 @@ class LiveWatchHandler(BaseCallbackHandler):
                                 evidence=agent_text,
                                 severity="critical"
                             )
+
+        layer1_found_issue = len(self.flags) > flags_before_this_check
+
+        if self.use_semantic_layer and not layer1_found_issue:
+            context = self.last_tool_output or ""
+            if semantic_check(agent_text, context):
+                self._log_flag(
+                    "SEMANTIC_ANOMALY",
+                    "GPT-4o-mini flagged a subtle issue not caught by deterministic checks",
+                    evidence=agent_text,
+                    severity="medium"
+                )
+
         self.agent_claims.append((len(self.steps), agent_text))
 
         for mechanism, claim_phrases in MECHANISM_CLAIMS.items():
