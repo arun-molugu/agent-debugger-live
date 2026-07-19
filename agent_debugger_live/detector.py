@@ -5,10 +5,12 @@ from openai import OpenAI
 
 SUCCESS_CLAIMS = [
     "successfully", "confirmed", "completed", "is trading at",
-    "is currently", "found", "processed", "delivered", "delivery",
-    "is ready", "is confirmed", "is complete", "is being processed"
+    "is currently", "processed", "delivered", "delivery",
+    "is ready", "is confirmed", "is complete", "is being processed",
     "will process", "will refund", "right away", "i will process"
 ]
+
+NEGATION_WORDS = ["not", "cannot", "unable", "couldn't", "wasn't", "isn't", "doesn't", "no", "does not", "did not"]
 
 RETRY_WORDS = ["retry", "retrying", "attempting again", "trying again"]
 PERMISSION_WORDS = [
@@ -69,6 +71,7 @@ def extract_topic_keywords(text: str) -> set:
     words = re.findall(r'\b[a-z]+\b', text.lower())
     return {w for w in words if w not in STOP_WORDS and len(w) > 3}
 
+
 def extract_numbers(text: str) -> list:
     return [n.rstrip('.') for n in re.findall(r'-?\d+\.?\d*', text)]
 
@@ -99,6 +102,24 @@ Does this agent response contain a subtle logical contradiction, an unsupported 
     except Exception:
         return False
 
+
+def check_success_claim(content_lower: str) -> bool:
+    """
+    Checks if text contains a genuine success claim, ignoring
+    matches that are directly negated (e.g. 'not found', 'was not processed').
+    Only checks negation words within 15 characters BEFORE the match,
+    so unrelated negations elsewhere in the sentence don't cancel a real claim.
+    """
+    for word in SUCCESS_CLAIMS:
+        idx = content_lower.find(word)
+        if idx == -1:
+            continue
+        nearby_text = content_lower[max(0, idx - 15):idx]
+        if not any(neg in nearby_text for neg in NEGATION_WORDS):
+            return True
+    return False
+
+
 class LiveWatchHandler(BaseCallbackHandler):
     def __init__(self, verbose: bool = True, block_on_critical: bool = False, use_semantic_layer: bool = False):
         self.steps = []
@@ -113,7 +134,7 @@ class LiveWatchHandler(BaseCallbackHandler):
         self.blocked = False
         self.use_semantic_layer = use_semantic_layer
         self.retry_count = 0
-        self.last_tool_error = False 
+        self.last_tool_error = False
         self.tool_calls_since_error = 0
         self.agent_claims = []
         self.all_content_history = []
@@ -171,14 +192,13 @@ class LiveWatchHandler(BaseCallbackHandler):
             )
         elif self.last_tool_error:
             self.tool_calls_since_error += 1
-    
+
     def log_user_query(self, query: str):
         self.user_query = query.lower()
 
     def check_agent_response(self, agent_text: str, is_validator_complaint: bool = False):
         content_lower = agent_text.lower()
-        claims_success = any(word in content_lower for word in SUCCESS_CLAIMS)
-        flags_before_this_check = len(self.flags)
+        claims_success = check_success_claim(content_lower)
 
         self.steps.append({
             "step": len(self.steps) + 1,
@@ -234,10 +254,10 @@ class LiveWatchHandler(BaseCallbackHandler):
                     "Agent answered a query requiring real-time or external data without calling any tool",
                     evidence=agent_text
                 )
-    
+
         shows_incomplete_intent = any(sig in content_lower for sig in INCOMPLETE_SIGNALS)
         shows_completion = any(sig in content_lower for sig in COMPLETION_SIGNALS)
-        
+
         if shows_incomplete_intent and not shows_completion:
             self._log_flag(
                 "GOAL_ABANDONMENT",
@@ -254,7 +274,7 @@ class LiveWatchHandler(BaseCallbackHandler):
                     evidence=agent_text
                 )
                 self.last_scheduled_date = None
-  
+
         is_hallucinated_retry = any(claim in content_lower for claim in RETRY_SUCCESS_CLAIMS)
         if is_hallucinated_retry and self.last_tool_error and self.tool_calls_since_error == 0:
             self._log_flag(
@@ -262,7 +282,7 @@ class LiveWatchHandler(BaseCallbackHandler):
                 "Agent claimed retry succeeded but no retry tool call happened after the error",
                 evidence=agent_text,
                 severity="critical"
-            ) 
+            )
 
         is_retry = any(word in content_lower for word in RETRY_WORDS)
         if is_retry:
@@ -323,7 +343,8 @@ class LiveWatchHandler(BaseCallbackHandler):
                                 severity="critical"
                             )
 
-        layer1_found_issue = len(self.flags) > flags_before_this_check
+        flags_before_this_check = len(self.flags)
+        layer1_found_issue = False
 
         if self.use_semantic_layer and not layer1_found_issue:
             context = self.last_tool_output or ""
@@ -381,3 +402,7 @@ class LiveWatchHandler(BaseCallbackHandler):
         self.blocked = False
         return was_blocked
 
+    def get_safe_response(self, original_response: str) -> str:
+        if self.should_block():
+            return "[This response was withheld due to a detected reliability issue. A human has been notified.]"
+        return original_response
