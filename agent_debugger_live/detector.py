@@ -7,6 +7,7 @@ SUCCESS_CLAIMS = [
     "successfully", "confirmed", "completed", "is trading at",
     "is currently", "found", "processed", "delivered", "delivery",
     "is ready", "is confirmed", "is complete", "is being processed"
+    "will process", "will refund", "right away", "i will process"
 ]
 
 RETRY_WORDS = ["retry", "retrying", "attempting again", "trying again"]
@@ -132,7 +133,10 @@ class LiveWatchHandler(BaseCallbackHandler):
             print(f"   🛑 BLOCKED: This response will not be sent to the user.\n")
 
     def on_tool_end(self, output, **kwargs):
-        content = str(output)
+        if hasattr(output, "content"):
+            content = str(output.content)
+        else:
+            content = str(output)
         self.last_tool_output = content
         self.tool_was_called = True
 
