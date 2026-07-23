@@ -90,3 +90,5 @@ Early-stage, not production infrastructure. Detection is deterministic keyword/t
 ## Feedback
 
 If you run this on your own agent and it catches — or misses — something interesting, I genuinely want to hear about it. Open an issue, or DM me.
+
+Agent execution also verified on OpenAI's newest reasoning models (gpt-5.6-terra) by passing `ChatOpenAI(model=..., use_responses_api=True)` into `create_agent`; note these models return structured content, so extract the text before calling `check_agent_response`.
