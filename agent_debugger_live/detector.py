@@ -73,7 +73,9 @@ def extract_topic_keywords(text: str) -> set:
 
 
 def extract_numbers(text: str) -> list:
-    return [n.rstrip('.') for n in re.findall(r'-?\d+\.?\d*', text)]
+    # (?<![A-Za-z0-9]) prevents the hyphen in IDs like "ORD-4471"
+    # from being read as a negative sign, while real negatives ("-42") still match.
+    return [n.rstrip('.') for n in re.findall(r'(?<![A-Za-z0-9])-?\d+\.?\d*', text)]
 
 
 def semantic_check(agent_text: str, context: str = "") -> bool:
@@ -138,6 +140,11 @@ class LiveWatchHandler(BaseCallbackHandler):
         self.tool_calls_since_error = 0
         self.agent_claims = []
         self.all_content_history = []
+        # Cross-node propagation tracking:
+        # when a node's response gets flagged high/critical, its numbers and
+        # keywords become "tainted". If a DIFFERENT node later repeats them,
+        # the failure has propagated across the graph.
+        self.tainted_claims = []  # list of dicts: {node, numbers, keywords, flag_type}
 
     def _log_flag(self, flag_type: str, message: str, evidence: str = "", severity: str = "medium"):
         flag = {"type": flag_type, "message": message, "evidence": evidence, "severity": severity}
@@ -196,9 +203,34 @@ class LiveWatchHandler(BaseCallbackHandler):
     def log_user_query(self, query: str):
         self.user_query = query.lower()
 
-    def check_agent_response(self, agent_text: str, is_validator_complaint: bool = False):
+    def check_agent_response(self, agent_text: str, is_validator_complaint: bool = False, node: str = None):
         content_lower = agent_text.lower()
         claims_success = check_success_claim(content_lower)
+        flags_before = len(self.flags)
+
+        # --- CROSS_NODE_PROPAGATION check (runs first, against prior tainted claims) ---
+        if node is not None:
+            curr_nums = {n for n in extract_numbers(agent_text) if abs(float(n)) > 10}
+            curr_keys = extract_topic_keywords(agent_text)
+            for taint in self.tainted_claims:
+                if taint["node"] == node:
+                    continue  # same node repeating itself is not propagation
+                shared_nums = curr_nums & taint["numbers"]
+                shared_keys = curr_keys & taint["keywords"]
+                if shared_nums or len(shared_keys) >= 3:
+                    detail = (
+                        f"repeated unverified value(s) {sorted(shared_nums)}"
+                        if shared_nums
+                        else f"repeated flagged concepts {sorted(shared_keys)[:5]}"
+                    )
+                    self._log_flag(
+                        "CROSS_NODE_PROPAGATION",
+                        f"Node '{node}' consumed a flagged claim from node '{taint['node']}' "
+                        f"({taint['flag_type']}) and {detail} as if verified",
+                        evidence=agent_text,
+                        severity="critical"
+                    )
+                    break
 
         self.steps.append({
             "step": len(self.steps) + 1,
@@ -328,8 +360,12 @@ class LiveWatchHandler(BaseCallbackHandler):
                 pval = float(pn)
                 if abs(pval) < 10:
                     continue
+                if pn in curr_numbers:
+                    continue  # agent restates the same value consistently - not a contradiction
                 for cn in curr_numbers:
                     cval = float(cn)
+                    if abs(cval - pval) > pval * 0.5:
+                        continue  # different magnitude = different quantity (order ID vs tracking number), not a contradiction
                     if abs(cval) > 10 and abs(cval - pval) > 0.01:
                         prev_words = set(prev_claim.lower().split())
                         curr_words = set(agent_text.lower().split())
@@ -374,6 +410,21 @@ class LiveWatchHandler(BaseCallbackHandler):
                     evidence=agent_text,
                     severity="high"
                 )
+
+        # --- Taint registration: if THIS response was flagged high/critical,
+        # remember its numbers/keywords so downstream nodes repeating them get caught ---
+        if node is not None:
+            new_flags = self.flags[flags_before:]
+            serious = [f for f in new_flags
+                       if f["severity"] in ("high", "critical")
+                       and f["type"] != "CROSS_NODE_PROPAGATION"]
+            if serious:
+                self.tainted_claims.append({
+                    "node": node,
+                    "numbers": {n for n in extract_numbers(agent_text) if abs(float(n)) > 10},
+                    "keywords": extract_topic_keywords(agent_text),
+                    "flag_type": serious[0]["type"],
+                })
 
         if is_validator_complaint:
             topics = extract_topic_keywords(agent_text)

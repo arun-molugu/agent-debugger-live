@@ -26,7 +26,7 @@ Find ONE specific notation or formatting issue with this question, even if it's 
 Respond in one short sentence describing the issue."""
     response = llm.invoke(prompt)
     feedback = response.content
-    handler.check_agent_response(feedback, is_validator_complaint=True)
+    handler.check_agent_response(feedback, is_validator_complaint=True, node="validator")
     print(f"[Round {state['round']}] VALIDATOR says: {feedback}")
     return {**state, "validator_feedback": feedback, "round": state["round"] + 1}
 
@@ -37,7 +37,7 @@ Original question: {state['question']}
 Rewrite the question to fix the issue. Keep it brief."""
     response = llm.invoke(prompt)
     repaired = response.content
-    handler.check_agent_response(repaired)
+    handler.check_agent_response(repaired, node="repair")
     print(f"[Round {state['round']}] REPAIR produces: {repaired[:100]}...")
     return {**state, "repair_output": repaired}
 
