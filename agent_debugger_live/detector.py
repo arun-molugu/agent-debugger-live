@@ -177,6 +177,44 @@ class LiveWatchHandler(BaseCallbackHandler):
         Call once at the start of a session/pipeline run."""
         self.all_content_history.append(str(text).lower())
 
+    def check_routing_decision(self, query: str, chosen_route: str,
+                               route_domains: dict):
+        """
+        ROUTING_MISMATCH - for DYNAMIC orchestration only (a supervisor
+        picking one of several branches at runtime, e.g. LangGraph
+        conditional edges). Compares the query's real topic against the
+        domain each available route covers, and flags if a route with a
+        clearly stronger topic match existed but wasn't chosen.
+
+        This catches a structurally different failure than the fixed-
+        pipeline checks: not "an agent said something false", but "the
+        orchestrator sent the query down the wrong branch entirely" - the
+        chosen specialist can answer perfectly well and still be wrong,
+        because it was never the right specialist for this query.
+
+        query: the original user query.
+        chosen_route: the route name the supervisor picked.
+        route_domains: {route_name: set_of_keywords_that_route_covers}.
+        """
+        query_kw = extract_topic_keywords(query)
+        scores = {route: len(query_kw & kws) for route, kws in route_domains.items()}
+        if not scores or chosen_route not in scores:
+            return
+        best_route = max(scores, key=scores.get)
+        chosen_score = scores[chosen_route]
+        best_score = scores[best_route]
+        # Only flag when another route CLEARLY covers this query's topic
+        # better - avoids punishing genuinely ambiguous queries.
+        if best_route != chosen_route and best_score >= 2 and best_score > chosen_score:
+            self._log_flag(
+                "ROUTING_MISMATCH",
+                f"Supervisor routed to '{chosen_route}' but the query's topic "
+                f"matches '{best_route}' more closely (matched keywords: "
+                f"{sorted(query_kw & route_domains[best_route])})",
+                evidence=query,
+                severity="critical"
+            )
+
     def _log_flag(self, flag_type: str, message: str, evidence: str = "", severity: str = "medium"):
         flag = {"type": flag_type, "message": message, "evidence": evidence, "severity": severity}
         self.flags.append(flag)
