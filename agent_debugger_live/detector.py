@@ -4,13 +4,22 @@ from langchain_core.callbacks import BaseCallbackHandler
 from openai import OpenAI
 
 SUCCESS_CLAIMS = [
-    "successfully", "confirmed", "completed", "is trading at",
-    "is currently", "processed", "delivered", "delivery",
+    "successfully", "confirmed", "completed", "trading at",
+    "processed", "has been delivered", "was delivered", "delivered successfully",
     "is ready", "is confirmed", "is complete", "is being processed",
     "will process", "will refund", "right away", "i will process"
 ]
 
-NEGATION_WORDS = ["not", "cannot", "unable", "couldn't", "wasn't", "isn't", "doesn't", "no", "does not", "did not"]
+NEGATION_WORDS = ["not", "cannot", "unable", "couldn't", "wasn't", "isn't", "doesn't", "no", "does not", "did not", "unknown", "unavailable"]
+
+# Distinct from negation: these mark a claim as a FUTURE promise, not a present
+# success statement - "we'll share it once we have confirmed information" is
+# not the same claim as "it is confirmed". Caught separately because no
+# negation word widening would ever find these; the issue is tense, not distance.
+FUTURE_CONDITIONAL_MARKERS = ["as soon as we", "once we have", "once we receive",
+                              "when we have", "will share", "will provide",
+                              "will update you once", "as soon as it is"]
+
 
 RETRY_WORDS = ["retry", "retrying", "attempting again", "trying again"]
 PERMISSION_WORDS = [
@@ -107,17 +116,33 @@ Does this agent response contain a subtle logical contradiction, an unsupported 
 
 def check_success_claim(content_lower: str) -> bool:
     """
-    Checks if text contains a genuine success claim, ignoring
-    matches that are directly negated (e.g. 'not found', 'was not processed').
-    Only checks negation words within 15 characters BEFORE the match,
-    so unrelated negations elsewhere in the sentence don't cancel a real claim.
+    Checks if text contains a genuine success claim, ignoring matches that
+    are negated ANYWHERE in the same sentence (e.g. 'not found', 'no shipping
+    carrier or tracking number can be confirmed', 'cannot currently be
+    confirmed'). Scoped to the sentence containing the claim word - not a
+    fixed character count - because negation can sit an arbitrary distance
+    before the claim word depending on how long the clause in between is.
+    A fixed-width window was tried first and kept missing longer clauses;
+    sentence-scoping fixes the whole failure class at once instead of one
+    phrasing at a time.
     """
+    sentences = re.split(r'(?<=[.!?])\s+', content_lower)
     for word in SUCCESS_CLAIMS:
         idx = content_lower.find(word)
         if idx == -1:
             continue
-        nearby_text = content_lower[max(0, idx - 15):idx]
-        if not any(neg in nearby_text for neg in NEGATION_WORDS):
+        prefix_negated = content_lower[max(0, idx - 2):idx] == "un"  # e.g. "unprocessed"
+        if prefix_negated:
+            continue
+        running = 0
+        sentence = content_lower
+        for s in sentences:
+            if running <= idx < running + len(s) + 1:
+                sentence = s
+                break
+            running += len(s) + 1
+        if not any(neg in sentence for neg in NEGATION_WORDS) and \
+           not any(marker in sentence for marker in FUTURE_CONDITIONAL_MARKERS):
             return True
     return False
 
@@ -145,6 +170,12 @@ class LiveWatchHandler(BaseCallbackHandler):
         # keywords become "tainted". If a DIFFERENT node later repeats them,
         # the failure has propagated across the graph.
         self.tainted_claims = []  # list of dicts: {node, numbers, keywords, flag_type}
+
+    def register_context(self, text: str):
+        """Feed the handler known context (the user's request, order IDs, amounts)
+        so those values are never mistaken for numbers an agent invented.
+        Call once at the start of a session/pipeline run."""
+        self.all_content_history.append(str(text).lower())
 
     def _log_flag(self, flag_type: str, message: str, evidence: str = "", severity: str = "medium"):
         flag = {"type": flag_type, "message": message, "evidence": evidence, "severity": severity}
@@ -207,6 +238,32 @@ class LiveWatchHandler(BaseCallbackHandler):
         content_lower = agent_text.lower()
         claims_success = check_success_claim(content_lower)
         flags_before = len(self.flags)
+
+        # --- FABRICATED_IDENTIFIER: agent admits the lookup failed, but still
+        # states a specific tracking/order/reference number as if it were real.
+        # Different from HALLUCINATION (which needs a success-claim word like
+        # "processed") - this catches a lie hiding INSIDE an honest admission,
+        # e.g. "untraceable in our system, use tracking number 1Z2345W67890".
+        ADMISSION_PHRASES = ["untraceable", "not found", "no record", "no matching",
+                             "cannot be found", "could not be found", "no matching record"]
+        # A plausible invented identifier: a token mixing letters+digits (like a
+        # real tracking number) that's long enough to look specific, and that
+        # never appeared in the tool's actual output or prior real context.
+        ID_PATTERN = re.compile(r'\b(?=[a-z0-9]*\d)(?=[a-z0-9]*[a-z])[a-z0-9]{8,}\b', re.IGNORECASE)
+        if self.last_tool_output is not None and not self.last_tool_output.strip():
+            if any(p in content_lower for p in ADMISSION_PHRASES):
+                known_context = " ".join(self.all_content_history).lower()
+                for candidate in ID_PATTERN.findall(agent_text):
+                    if candidate.lower() not in known_context:
+                        self._log_flag(
+                            "FABRICATED_IDENTIFIER",
+                            f"Agent admitted the lookup failed, but stated a specific "
+                            f"identifier ('{candidate}') that never came from the tool "
+                            f"or prior context - likely invented",
+                            evidence=agent_text,
+                            severity="critical"
+                        )
+                        break
 
         # --- CROSS_NODE_PROPAGATION check (runs first, against prior tainted claims) ---
         if node is not None:
@@ -419,9 +476,16 @@ class LiveWatchHandler(BaseCallbackHandler):
                        if f["severity"] in ("high", "critical")
                        and f["type"] != "CROSS_NODE_PROPAGATION"]
             if serious:
+                # Only taint numbers this node INTRODUCED. Numbers already present
+                # earlier in the session (order IDs, amounts from the user's request)
+                # are shared context, not evidence of propagation - every honest
+                # downstream node will legitimately repeat them.
+                prior_text = " ".join(self.all_content_history[:-1])
+                introduced = {n for n in extract_numbers(agent_text)
+                              if abs(float(n)) > 10 and n not in prior_text}
                 self.tainted_claims.append({
                     "node": node,
-                    "numbers": {n for n in extract_numbers(agent_text) if abs(float(n)) > 10},
+                    "numbers": introduced,
                     "keywords": extract_topic_keywords(agent_text),
                     "flag_type": serious[0]["type"],
                 })
